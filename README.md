@@ -16,7 +16,7 @@ No letters, no ads, no accounts. Made for iPad. Works on iPhone too.
 
 > ### ⚠️ Do the steps first. Don't tap Start in Safari.
 > Add it to your Home Screen, then open it from there.
-> (Safari's own full-screen mode can pop up a "fake keyboard" warning.)
+> (Safari blocks repeated keystrokes in full-screen mode.)
 
 ### 1. Open the address in Safari
 
