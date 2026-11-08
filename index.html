@@ -131,8 +131,44 @@
     50% { scale: 1.045; }
   }
 
+  .sound {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    margin: 30px 0 0;
+    font-size: 18px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.8);
+  }
+  .seg {
+    display: flex;
+    padding: 4px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .seg button {
+    appearance: none;
+    -webkit-appearance: none;
+    border: 0;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.75);
+    background: transparent;
+    min-width: 76px;
+    padding: 12px 24px;
+    border-radius: 999px;
+    transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
+  }
+  .seg button:active { transform: scale(0.94); }
+  .seg button[aria-pressed="true"] {
+    background: #fff;
+    color: #3a1470;
+  }
+
   .foot {
-    margin: 28px auto 0;
+    margin: 24px auto 0;
     max-width: 34ch;
     font-size: 15px;
     line-height: 1.4;
@@ -199,6 +235,13 @@
     <h1>Tiny Pops</h1>
     <p class="intro-text">Tap, smash and swipe the screen.<br />Use as many fingers as you like.</p>
     <button id="start" class="start" type="button">Start</button>
+    <div class="sound" role="group" aria-label="Sound">
+      <span>Sound</span>
+      <div class="seg">
+        <button id="snd-off" type="button" aria-pressed="false">Off</button>
+        <button id="snd-on" type="button" aria-pressed="true">On</button>
+      </div>
+    </div>
     <p class="foot">Grown-ups: hold the small exit button in the corner to come back here.</p>
   </div>
 </section>
@@ -504,6 +547,12 @@
     tr.acc += d;
     tr.sacc += d;
 
+    tr.snd += d;
+    if (tr.snd >= 62) {
+      tr.snd = Math.min(tr.snd - 62, 62);
+      playSparkle(Math.hypot(tr.vx, tr.vy));
+    }
+
     const ang = Math.atan2(dy, dx);
 
     // Sparkles and emoji are placed along the segment, not piled at its end,
@@ -607,6 +656,162 @@
     }
   }
 
+  // ── Sound (synthesised with Web Audio, no files) ─────────────────────
+  let soundOn = true;
+  try { soundOn = localStorage.getItem('tinypops-sound') !== '0'; } catch (_) {}
+
+  let actx = null, master = null, echoIn = null, pianoBus = null, noiseBuf = null;
+  let voices = 0, lastTapSnd = -1, lastSparkleSnd = -1;
+
+  function ensureAudio() {
+    try {
+      if (!actx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        actx = new AC();
+        const comp = actx.createDynamicsCompressor();   // keeps a pile of smashes from clipping
+        comp.threshold.value = -14;
+        comp.ratio.value = 6;
+        comp.attack.value = 0.003;
+        comp.release.value = 0.15;
+        master = actx.createGain();
+        master.gain.value = 0.8;
+        master.connect(comp);
+        comp.connect(actx.destination);
+
+        // A light echo that only the sparkle sound feeds, for the shimmer.
+        echoIn = actx.createGain();
+        const delay = actx.createDelay(0.5);
+        delay.delayTime.value = 0.11;
+        const fb = actx.createGain();
+        fb.gain.value = 0.28;
+        const wet = actx.createGain();
+        wet.gain.value = 0.35;
+        echoIn.connect(delay);
+        delay.connect(fb);
+        fb.connect(delay);
+        delay.connect(wet);
+        wet.connect(master);
+
+        // The piano goes through a gentle low-pass so it stays mellow, never glassy.
+        pianoBus = actx.createBiquadFilter();
+        pianoBus.type = 'lowpass';
+        pianoBus.frequency.value = 3200;
+        pianoBus.Q.value = 0.4;
+        pianoBus.connect(master);
+
+        // A few milliseconds of noise for the soft "thump" of the hammer.
+        noiseBuf = actx.createBuffer(1, Math.floor(actx.sampleRate * 0.06), actx.sampleRate);
+        const nd = noiseBuf.getChannelData(0);
+        for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+
+        // iOS wants a sound started inside a tap to unlock audio.
+        const b = actx.createBuffer(1, 1, 22050);
+        const src = actx.createBufferSource();
+        src.buffer = b;
+        src.connect(actx.destination);
+        src.start(0);
+      }
+      if (actx.state !== 'running') actx.resume();
+    } catch (_) {}
+  }
+
+  const audioReady = () => soundOn && actx && actx.state === 'running' && voices < 60;
+
+  function voice(type, f0, f1, t0, attack, decay, peak, dest) {
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t0);
+    if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t0 + decay * 0.55);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + decay);
+    o.connect(g);
+    g.connect(dest);
+    voices++;
+    o.onended = () => { voices--; try { g.disconnect(); } catch (_) {} };
+    o.start(t0);
+    o.stop(t0 + decay + 0.03);
+  }
+
+  // The tap sound: a soft piano note. The notes form a pentatonic "ladder" (C D E G A,
+  // repeated over three octaves) and each tap walks one or two steps up or down it,
+  // like a little tune, instead of jumping anywhere. Any run of notes sits well together.
+  const LADDER = [
+    261.63, 293.66, 329.63, 392.0, 440.0,       // C4 D4 E4 G4 A4
+    523.25, 587.33, 659.25, 783.99, 880.0,      // C5 D5 E5 G5 A5
+    1046.5, 1174.66,                            // C6 D6  (the ceiling, so highs stay gentle)
+  ];
+  let noteIdx = 5, noteDir = 1, lastNoteT = -10;
+  function pickNote(t) {
+    if (t - lastNoteT > 2.5) {
+      // After a pause, start a fresh phrase somewhere in the comfortable middle.
+      noteIdx = 3 + Math.floor(Math.random() * 5);
+      noteDir = Math.random() < 0.5 ? -1 : 1;
+    } else {
+      if (Math.random() < 0.35) noteDir = -noteDir;          // sometimes turn around
+      const step = Math.random() < 0.6 ? 1 : 2;              // the next note, or the one after
+      let n = noteIdx + noteDir * step;
+      if (n < 0 || n >= LADDER.length) {                     // bounce off the ends
+        noteDir = -noteDir;
+        n = noteIdx + noteDir * step;
+      }
+      noteIdx = n;
+    }
+    lastNoteT = t;
+    return { hz: LADDER[noteIdx], gain: 1 - 0.022 * noteIdx };   // higher notes a bit quieter
+  }
+  function playTap() {
+    if (!audioReady()) return;
+    const t = actx.currentTime;
+    if (t - lastTapSnd < 0.02) return;
+    lastTapSnd = t;
+    const { hz, gain } = pickNote(t);
+    const g = gain * (0.82 + Math.random() * 0.18);          // each key press a touch different
+
+    // Body of the note, plus a slightly detuned second "string" for warmth.
+    voice('sine', hz, hz, t, 0.004, 1.05, 0.30 * g, pianoBus);
+    voice('sine', hz * 1.0035, hz * 1.0035, t, 0.004, 0.95, 0.11 * g, pianoBus);
+    // Upper harmonics fade faster than the fundamental, as on a real piano.
+    voice('triangle', hz * 2, hz * 2, t, 0.003, 0.55, 0.13 * g, pianoBus);
+    voice('sine', hz * 3, hz * 3, t, 0.003, 0.30, 0.05 * g, pianoBus);
+
+    // Hammer thump.
+    const src = actx.createBufferSource();
+    src.buffer = noiseBuf;
+    const bp = actx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = Math.min(1800, hz * 3);
+    bp.Q.value = 0.8;
+    const ng = actx.createGain();
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.exponentialRampToValueAtTime(0.06 * g, t + 0.002);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.04);
+    src.connect(bp);
+    bp.connect(ng);
+    ng.connect(pianoBus);
+    src.onended = () => { try { ng.disconnect(); bp.disconnect(); } catch (_) {} };
+    src.start(t);
+    src.stop(t + 0.06);
+  }
+
+  // The drag sound: a small twinkle with a shimmer tail, pitched lower and a bit softer
+  // than before. Faster swipes tend higher.
+  const SPARKLE_NOTES = [784, 880, 1046.5, 1174.7, 1318.5, 1568];   // G5 A5 C6 D6 E6 G6
+  function playSparkle(speed) {
+    if (!audioReady()) return;
+    const t = actx.currentTime;
+    if (t - lastSparkleSnd < 0.08) return;
+    lastSparkleSnd = t;
+    const bias = Math.min(3, Math.floor(speed / 700));
+    const idx = Math.min(SPARKLE_NOTES.length - 1, bias + Math.floor(Math.random() * 3));
+    const f = SPARKLE_NOTES[idx];
+    voice('sine', f, f * 1.03, t, 0.003, 0.3, 0.085, master);
+    voice('sine', f * 2, f * 2.04, t, 0.003, 0.22, 0.025, master);
+    voice('sine', f, f * 1.03, t, 0.003, 0.3, 0.045, echoIn);
+  }
+
   // ── Input (multitouch via Pointer Events) ─────────────────────────────
   let running = false;
 
@@ -621,9 +826,11 @@
       lastT: now, lastSpark: now,
       vx: 0, vy: 0,
       hue: 44, dist: rand(0, 2000), phase: rand(0, TAU),
-      acc: 0, sacc: 0, gap: rand(30, 55),
+      acc: 0, sacc: 0, snd: 0, gap: rand(30, 55),
     });
+    if (actx && actx.state !== 'running') actx.resume();
     tapBurst(e.clientX, e.clientY);
+    playTap();
   });
 
   canvas.addEventListener('pointermove', (e) => {
@@ -647,7 +854,10 @@
     pointers.delete(e.pointerId);
     fading.push(tr);
   }
-  window.addEventListener('pointerup', endPointer);
+  window.addEventListener('pointerup', (e) => {
+    if (actx && actx.state !== 'running') actx.resume();
+    endPointer(e);
+  });
   window.addEventListener('pointercancel', endPointer);
 
   // Keep iPad from zooming, scrolling, or selecting things.
@@ -849,6 +1059,7 @@
 
   function start() {
     if (running) return;
+    if (soundOn) ensureAudio();       // unlock audio inside the tap
     requestFS();                      // must happen inside the tap handler
     running = true;
     intro.classList.add('is-hidden');
@@ -867,6 +1078,31 @@
   }
 
   startBtn.addEventListener('click', start);
+
+  // Sound switch on the intro screen. Pressing On plays the tap sound as a preview.
+  const sndOff = document.getElementById('snd-off');
+  const sndOn = document.getElementById('snd-on');
+  function syncSoundUI() {
+    sndOn.setAttribute('aria-pressed', String(soundOn));
+    sndOff.setAttribute('aria-pressed', String(!soundOn));
+  }
+  function setSound(on) {
+    soundOn = on;
+    try { localStorage.setItem('tinypops-sound', on ? '1' : '0'); } catch (_) {}
+    syncSoundUI();
+    if (on) {
+      ensureAudio();
+      // A freshly created context takes a moment to start; preview the pop once it's running.
+      if (actx && actx.state !== 'running') {
+        actx.resume().then(playTap).catch(() => {});
+      } else {
+        playTap();
+      }
+    }
+  }
+  sndOn.addEventListener('click', () => setSound(true));
+  sndOff.addEventListener('click', () => setSound(false));
+  syncSoundUI();
 
   // Hold-to-exit
   let holdTimer = null;
