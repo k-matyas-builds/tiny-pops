@@ -802,7 +802,15 @@
   const isFS = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
   let fsEntered = false;
 
+  // From the Home Screen icon the page already fills the screen, and Safari's
+  // fullscreen mode adds a "fake keyboard" warning whenever a key is pressed.
+  // So only request fullscreen in a normal browser tab. Add ?fs=0 to the URL to skip it.
+  const standalone = window.navigator.standalone === true ||
+    window.matchMedia('(display-mode: standalone)').matches;
+  const skipFS = standalone || /[?&]fs=0(&|$)/.test(window.location.search);
+
   function requestFS() {
+    if (skipFS) return;
     const el = document.documentElement;
     try {
       if (el.requestFullscreen) {
