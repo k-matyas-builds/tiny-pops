@@ -294,22 +294,32 @@
   // ── Canvas ────────────────────────────────────────────────────────────
   const canvas = document.getElementById('stage');
   const ctx = canvas.getContext('2d', { alpha: false });
-  const bg = document.createElement('canvas');   // low-res background, scaled up = free blur
-  const bgx = bg.getContext('2d');
 
   let W = window.innerWidth;
   let H = window.innerHeight;
   let DPR = Math.min(window.devicePixelRatio || 1, 2);
 
+  // Size scaling. Screens at iPad-mini size and up keep full-size emoji (scale 1).
+  // Phones ease down but never shrink below a floor, so a tap still feels like a
+  // satisfying pop. The comet trail only gets a gentle trim.
+  let SCALE = 1, TRAIL_SCALE = 1;
+  function computeScale() {
+    const short = Math.min(window.innerWidth, window.innerHeight);   // 744 on iPad mini
+    const t = Math.min(1, Math.max(0, (short - 375) / (744 - 375)));  // 0 on small phones, 1 on iPad mini
+    SCALE = 0.58 + 0.42 * t;
+    TRAIL_SCALE = 0.84 + 0.16 * t;
+  }
+  computeScale();
+
   function resize() {
+    computeScale();
     W = window.innerWidth;
     H = window.innerHeight;
     canvas.width = Math.round(W * DPR);
     canvas.height = Math.round(H * DPR);
     canvas.style.width = W + 'px';
     canvas.style.height = H + 'px';
-    bg.width = Math.max(64, Math.round(W / 8));
-    bg.height = Math.max(48, Math.round(H / 8));
+    buildBackground();
   }
 
   // ── Pre-rendered sprites ──────────────────────────────────────────────
@@ -397,45 +407,113 @@
   const resetTransform = () => ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
 
   // ── Background ────────────────────────────────────────────────────────
+  // Soft colour blobs over a deep indigo base. Each blob is a pre-baked sprite with an
+  // eased falloff (no visible rings) and is painted with plain alpha, so the colours stay
+  // rich instead of piling up into a washed-out glow. The blobs are painted ONCE into an
+  // oversized texture; each frame only pans and zooms a window over it, which is cheap
+  // even on small phones.
   const BLOBS = [
-    { c: '255,111,174', a: 0.34, r: 0.60, fx: 0.13, fy: 0.17, px: 0.0, py: 1.0 },
-    { c: '61,224,208',  a: 0.24, r: 0.55, fx: 0.11, fy: 0.15, px: 2.0, py: 0.3 },
-    { c: '255,211,106', a: 0.16, r: 0.50, fx: 0.17, fy: 0.10, px: 4.0, py: 2.2 },
-    { c: '142,107,255', a: 0.40, r: 0.65, fx: 0.09, fy: 0.14, px: 1.0, py: 3.5 },
-    { c: '90,168,255',  a: 0.24, r: 0.55, fx: 0.15, fy: 0.12, px: 5.0, py: 4.8 },
+    { c: [255, 105, 180], a: 0.30, r: 0.62 },   // pink
+    { c: [130, 92, 255],  a: 0.40, r: 0.78 },   // violet
+    { c: [50, 205, 200],  a: 0.17, r: 0.55 },   // teal
+    { c: [255, 190, 100], a: 0.05, r: 0.46 },   // amber
   ];
+  const LAYOUTS = [
+    [[0.28, 0.72], [0.72, 0.28], [0.55, 0.88], [0.15, 0.20]],
+  ];
+  const BLOB_SPRITE = 512;
+  function bakeBlobs() {
+    // Smooth bell-shaped falloff, close to a Gaussian.
+    const stops = [[0, 1], [0.12, 0.92], [0.25, 0.74], [0.4, 0.5], [0.55, 0.3], [0.7, 0.14], [0.85, 0.04], [1, 0]];
+    for (const b of BLOBS) {
+      const c = document.createElement('canvas');
+      c.width = c.height = BLOB_SPRITE;
+      const g = c.getContext('2d');
+      const h = BLOB_SPRITE / 2;
+      const gr = g.createRadialGradient(h, h, 0, h, h, h);
+      for (const [t, a] of stops) gr.addColorStop(t, `rgba(${b.c[0]},${b.c[1]},${b.c[2]},${a})`);
+      g.fillStyle = gr;
+      g.fillRect(0, 0, BLOB_SPRITE, BLOB_SPRITE);
+      b.sprite = c;
+    }
+  }
+
+  let bgTex = [];
+  function buildBackground() {
+    const TW = Math.ceil(W * 1.4), TH = Math.ceil(H * 1.4);
+    const big = Math.max(W, H);
+    bgTex = LAYOUTS.map((layout) => {
+      const c = document.createElement('canvas');
+      c.width = TW;
+      c.height = TH;
+      const g = c.getContext('2d');
+      g.imageSmoothingEnabled = true;
+      g.imageSmoothingQuality = 'high';
+      const lg = g.createLinearGradient(0, 0, 0, TH);
+      lg.addColorStop(0, '#1b1048');
+      lg.addColorStop(1, '#2a1664');
+      g.fillStyle = lg;
+      g.fillRect(0, 0, TW, TH);
+      BLOBS.forEach((b, i) => {
+        const d = big * b.r * 2;
+        g.globalAlpha = b.a;
+        g.drawImage(b.sprite, layout[i][0] * TW - d / 2, layout[i][1] * TH - d / 2, d, d);
+      });
+      return c;
+    });
+  }
+
+  // A whisper of fixed noise (about ±2 levels) breaks up the colour banding that smooth
+  // dark gradients otherwise show. It's too fine to read as grain.
+  let noisePattern = null;
+  function bakeNoise() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const d = g.createImageData(128, 128);
+    for (let i = 0; i < d.data.length; i += 4) {
+      const v = Math.random() < 0.5 ? 0 : 255;
+      d.data[i] = d.data[i + 1] = d.data[i + 2] = v;
+      d.data[i + 3] = 2;
+    }
+    g.putImageData(d, 0, 0);
+    noisePattern = ctx.createPattern(c, 'repeat');
+  }
+
   const STARS = Array.from({ length: 70 }, () => ({
     x: Math.random(), y: Math.random(),
     r: rand(5, 16), sp: rand(0.6, 2.2), ph: rand(0, TAU),
   }));
 
   function drawBackground(tSec) {
-    const bw = bg.width, bh = bg.height;
     const t = tSec * (REDUCED ? 0.3 : 1);
-    const lg = bgx.createLinearGradient(0, 0, 0, bh);
-    lg.addColorStop(0, '#1d1250');
-    lg.addColorStop(1, '#2b1766');
-    bgx.globalCompositeOperation = 'source-over';
-    bgx.fillStyle = lg;
-    bgx.fillRect(0, 0, bw, bh);
-    bgx.globalCompositeOperation = 'lighter';
-    for (const b of BLOBS) {
-      const x = bw * (0.5 + 0.38 * Math.sin(t * b.fx + b.px));
-      const y = bh * (0.5 + 0.38 * Math.cos(t * b.fy + b.py));
-      const r = Math.max(bw, bh) * b.r;
-      const g = bgx.createRadialGradient(x, y, 0, x, y, r);
-      g.addColorStop(0, `rgba(${b.c},${b.a})`);
-      g.addColorStop(1, `rgba(${b.c},0)`);
-      bgx.fillStyle = g;
-      bgx.fillRect(0, 0, bw, bh);
-    }
-    bgx.globalCompositeOperation = 'source-over';
-
     ctx.globalCompositeOperation = 'source-over';
-    ctx.globalAlpha = 1;
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(bg, 0, 0, W, H);
+
+    // The texture is a window that slowly pans and zooms.
+    const view = (tex, speed, ph) => {
+      const TW = tex.width, TH = tex.height;
+      const z = 1 + 0.07 * (0.5 + 0.5 * Math.sin(t * 0.06 * speed + ph));
+      const sw = W / z, sh = H / z;
+      const cx = TW / 2 + (TW - W) / 2 * 0.8 * Math.sin(t * 0.045 * speed + ph * 1.7);
+      const cy = TH / 2 + (TH - H) / 2 * 0.8 * Math.cos(t * 0.037 * speed + ph * 0.6);
+      const sx = Math.min(TW - sw, Math.max(0, cx - sw / 2));
+      const sy = Math.min(TH - sh, Math.max(0, cy - sh / 2));
+      ctx.drawImage(tex, sx, sy, sw, sh, 0, 0, W, H);
+    };
+    if (bgTex.length) {
+      ctx.globalAlpha = 1;
+      view(bgTex[0], 1, 0);
+    }
+
+    // fixed noise, drawn 1:1 in device pixels
+    if (noisePattern) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = noisePattern;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      resetTransform();
+    }
 
     ctx.globalCompositeOperation = 'lighter';
     for (const s of STARS) {
@@ -454,7 +532,7 @@
 
   function spawnPop(x, y, ambient) {
     const now = performance.now();
-    const size = ambient ? rand(80, 150) : rand(CFG.popSize[0], CFG.popSize[1]);
+    const size = (ambient ? rand(80, 150) : rand(CFG.popSize[0], CFG.popSize[1])) * SCALE;
     pops.push({
       x, y, size, born: now,
       spr: nextEmoji(ambient ? 0 : HORSE_CHANCE, true),
@@ -496,7 +574,7 @@
       spr: nextEmoji(o.horses ? HORSE_CHANCE : 0),
       g: o.g != null ? o.g : 520,
       drag: o.drag != null ? o.drag : 1.1,
-      size: o.size || rand(34, 72),
+      size: (o.size || rand(34, 72)) * SCALE,
       rot: rand(-1, 1),
       spin: rand(-5, 5) * (REDUCED ? 0.3 : 1),
       born: performance.now(),
@@ -512,7 +590,7 @@
     for (let i = 0; i < 12; i++) {
       const a = rand(0, TAU), sp = rand(160, 520);
       addGlow(x, y, Math.cos(a) * sp, Math.sin(a) * sp, {
-        size: rand(34, 76), life: rand(450, 800), drag: 3.2, hue: hue0 + rand(-60, 60),
+        size: rand(34, 76) * SCALE, life: rand(450, 800), drag: 3.2, hue: hue0 + rand(-60, 60),
       });
     }
     for (let i = 0; i < 4; i++) {
@@ -565,7 +643,7 @@
       const u = Math.min(1, Math.max(0, (d - (tr.sacc - 20)) / d));
       tr.sacc -= 20;
       addGlow(px + dx * u + rand(-5, 5), py + dy * u + rand(-5, 5), rand(-30, 30), rand(-30, 30), {
-        size: rand(30, 58), life: rand(500, 850), drag: 2, a: 0.32,
+        size: rand(30, 58) * SCALE, life: rand(500, 850), drag: 2, a: 0.32,
         hue: tr.hue - rand(0, 35),
       });
     }
@@ -599,8 +677,8 @@
       for (let i = 1; i < n; i++) total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
       const step = Math.max(4, total / 150);
       const dens = step / 4;
-      const base = CFG.trailWidth * 0.75;
-      const span = CFG.trailWidth * 4.0;
+      const base = CFG.trailWidth * TRAIL_SCALE * 0.75;
+      const span = CFG.trailWidth * TRAIL_SCALE * 4.0;
 
       const stamp = (x, y, l) => {
         if (l <= 0) return;
@@ -646,10 +724,10 @@
     }
 
     if (tr.active) {
-      const sz = 150 + 14 * Math.sin(now / 90);
+      const sz = (150 + 14 * Math.sin(now / 90)) * TRAIL_SCALE;
       ctx.globalAlpha = 0.9;
       ctx.drawImage(glowFor(tr.hue), tr.x - sz / 2, tr.y - sz / 2, sz, sz);
-      const core = 64;
+      const core = 64 * TRAIL_SCALE;
       ctx.globalAlpha = 1;
       ctx.drawImage(glowFor(tr.hue + 12), tr.x - core / 2, tr.y - core / 2, core, core);
       ctx.fillStyle = '#fff6dc';
@@ -988,7 +1066,7 @@
       if (now - tr.lastSpark > 130) {
         tr.lastSpark = now;
         addGlow(tr.x, tr.y, rand(-60, 60), rand(-90, -20), {
-          size: rand(26, 50), life: rand(500, 900), drag: 1.5, a: 0.4, hue: tr.hue - rand(0, 35),
+          size: rand(26, 50) * SCALE, life: rand(500, 900), drag: 1.5, a: 0.4, hue: tr.hue - rand(0, 35),
         });
       }
     }
@@ -1148,6 +1226,8 @@
   // ── Go ────────────────────────────────────────────────────────────────
   bakeEmoji();
   bakeGlows();
+  bakeBlobs();
+  bakeNoise();
   resize();
   requestAnimationFrame(frame);
 })();
